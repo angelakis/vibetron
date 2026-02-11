@@ -1,0 +1,411 @@
+#!/bin/bash
+set -euo pipefail
+
+# Defaults
+RAM="4G"
+CPUS="4"
+DISK_SIZE="10G"
+SSH_PORT=""
+CURRENT_DIR="$(pwd -P)"
+WAIT_TIMEOUT="${VIBETRON_WAIT_TIMEOUT:-300}"
+
+# Using genericcloud (has cloud-init for initial setup)
+IMAGE_NAME="debian-13-genericcloud-amd64-daily.qcow2"
+IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/daily/latest/$IMAGE_NAME"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vibetron"
+BAKED_IMAGE="$CACHE_DIR/baked.qcow2"
+BASE_IMAGE=""
+UPDATE_BAKED=0
+NO_BAKE=0
+
+usage() {
+    cat <<'USAGE'
+Usage: vibetron [options]
+
+Creates a VM using a prebaked Debian image, mounts the current folder, and
+provisions Claude Code and Codex for safe agent use.
+
+Options:
+  --ram SIZE               VM memory (default: 4G)
+  --cpus N                 VM CPU count (default: 4)
+  --disk SIZE              VM disk size for overlay (default: 10G)
+  --ssh-port PORT          SSH port (default: auto-pick free port)
+  --base-image PATH        Use a local base image instead of downloading
+  --image-url URL          Override Debian genericcloud image URL
+  --cache-dir PATH         Cache directory (default: ~/.cache/vibetron)
+  --baked-image PATH       Path to baked image (default: cache-dir/baked.qcow2)
+  --update-baked           Rebuild the baked image
+  --no-bake                Run without baking
+  --help                   Show this help and exit
+
+Notes:
+- Multiple concurrent runs are supported; an SSH port is auto-selected unless
+  you pass --ssh-port.
+- Inside the VM, aliases are provided:
+  - claude-yolo -> claude --dangerously-skip-permissions
+  - codex-yolo  -> codex  --dangerously-bypass-approvals-and-sandbox
+USAGE
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_value() {
+    [ $# -ge 2 ] || die "missing value for $1"
+}
+
+wait_for_ssh() {
+    local start="$SECONDS"
+    while ! ssh "${SSH_ARGS[@]}" -o ConnectTimeout=1 root@localhost true 2>/dev/null; do
+        if [ $((SECONDS - start)) -ge "$WAIT_TIMEOUT" ]; then
+            die "timed out waiting for SSH after ${WAIT_TIMEOUT}s"
+        fi
+        sleep 1
+    done
+}
+
+wait_for_cloud_init() {
+    local start="$SECONDS"
+    while ! ssh "${SSH_ARGS[@]}" root@localhost "cloud-init status --wait" >/dev/null 2>&1; do
+        if [ $((SECONDS - start)) -ge "$WAIT_TIMEOUT" ]; then
+            die "timed out waiting for cloud-init after ${WAIT_TIMEOUT}s"
+        fi
+        sleep 1
+    done
+}
+
+pick_free_port() {
+    # Random port check
+    for _ in $(seq 1 50); do
+        PORT=$(shuf -i 20000-45000 -n 1)
+        if ! ss -ltn "sport = :$PORT" 2>/dev/null | grep -q ":$PORT"; then
+            echo "$PORT"
+            return 0
+        fi
+    done
+    die "unable to find a free SSH port (install ss)"
+}
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ram)
+            require_value "$@"
+            RAM="$2"; shift 2 ;;
+        --cpus)
+            require_value "$@"
+            CPUS="$2"; shift 2 ;;
+        --disk)
+            require_value "$@"
+            DISK_SIZE="$2"; shift 2 ;;
+        --ssh-port)
+            require_value "$@"
+            SSH_PORT="$2"; shift 2 ;;
+        --base-image)
+            require_value "$@"
+            BASE_IMAGE="$2"; shift 2 ;;
+        --image-url)
+            require_value "$@"
+            IMAGE_URL="$2"; shift 2 ;;
+        --cache-dir)
+            require_value "$@"
+            CACHE_DIR="$2"; shift 2 ;;
+        --baked-image)
+            require_value "$@"
+            BAKED_IMAGE="$2"; shift 2 ;;
+        --update-baked)
+            UPDATE_BAKED=1; shift ;;
+        --no-bake)
+            NO_BAKE=1; shift ;;
+        --help|-h)
+            usage; exit 0 ;;
+        *)
+            die "unknown option: $1" ;;
+    esac
+
+done
+
+# Only run interactively unless exiting via --help above
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    die "must be run from a terminal"
+fi
+
+[ -z "$SSH_PORT" ] && SSH_PORT="$(pick_free_port)"
+
+# Tools
+need_cmd qemu-system-x86_64
+need_cmd qemu-img
+need_cmd ssh
+need_cmd ssh-keygen
+need_cmd curl
+need_cmd genisoimage
+
+mkdir -p "$CACHE_DIR"
+
+# Get or create SSH key
+SSH_KEY="$CACHE_DIR/vibetron_key"
+if [ ! -f "$SSH_KEY" ]; then
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -q
+fi
+SSH_PUBKEY=$(cat "$SSH_KEY.pub")
+
+SSH_ARGS=(-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" -p "$SSH_PORT")
+
+# Ensure claude and codex config dirs exist on host
+mkdir -p "$HOME/.claude" "$HOME/.codex"
+CLAUDE_LEGACY_HOST_FILE="$HOME/.claude.json"
+CLAUDE_MOUNT_FILE="$HOME/.claude/.claude.json"
+
+# Seed mounted Claude config from legacy host location once, if needed.
+if [ -f "$CLAUDE_LEGACY_HOST_FILE" ] && [ ! -f "$CLAUDE_MOUNT_FILE" ]; then
+    cp "$CLAUDE_LEGACY_HOST_FILE" "$CLAUDE_MOUNT_FILE"
+fi
+
+# Find or download base image unless provided
+if [ -z "$BASE_IMAGE" ]; then
+    DOWNLOADS_IMAGE="$HOME/Downloads/$IMAGE_NAME"
+    CACHED_IMAGE="$CACHE_DIR/$IMAGE_NAME"
+
+    if [ -f "$DOWNLOADS_IMAGE" ]; then
+        BASE_IMAGE="$DOWNLOADS_IMAGE"
+    elif [ -f "$CACHED_IMAGE" ]; then
+        BASE_IMAGE="$CACHED_IMAGE"
+    else
+        echo "Downloading Debian genericcloud image..."
+        curl -L "$IMAGE_URL" -o "$CACHED_IMAGE"
+        BASE_IMAGE="$CACHED_IMAGE"
+    fi
+fi
+
+[ -f "$BASE_IMAGE" ] || die "base image not found: $BASE_IMAGE"
+
+# Find virtiofsd
+VIRTIOFSD=""
+for path in /usr/libexec/virtiofsd /usr/lib/virtiofsd /usr/lib/qemu/virtiofsd; do
+    [ -x "$path" ] && VIRTIOFSD="$path" && break
+ done
+[ -z "$VIRTIOFSD" ] && die "virtiofsd not found. Install: sudo apt install virtiofsd"
+
+# ==========================================================================
+# BAKE IMAGE IF NEEDED
+# ==========================================================================
+if [ "$NO_BAKE" -eq 1 ]; then
+    [ "$UPDATE_BAKED" -eq 1 ] && die "--no-bake and --update-baked are incompatible"
+    [ -n "$BASE_IMAGE" ] || die "--no-bake requires --base-image"
+fi
+
+if [ "$NO_BAKE" -eq 0 ] && { [ ! -f "$BAKED_IMAGE" ] || [ "$UPDATE_BAKED" -eq 1 ]; }; then
+    echo "========================================"
+    echo "Creating baked image..."
+    echo "========================================"
+
+    BAKE_DIR=$(mktemp -d /tmp/vibetron-bake.XXXXXX)
+    BAKE_CLEANUP() { rm -rf "$BAKE_DIR"; }
+    trap BAKE_CLEANUP EXIT
+
+    # Create disk for baking (standalone, not overlay)
+    qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$BAKE_DIR/disk.qcow2" "$DISK_SIZE" > /dev/null
+
+    # Cloud-init for initial setup
+    mkdir -p "$BAKE_DIR/cidata"
+    cat > "$BAKE_DIR/cidata/meta-data" <<'EOMETA'
+instance-id: vibetron-bake
+local-hostname: vibetron
+EOMETA
+
+    cat > "$BAKE_DIR/cidata/user-data" <<EODATA
+#cloud-config
+users:
+  - name: root
+    ssh_authorized_keys:
+      - $SSH_PUBKEY
+ssh_pwauth: false
+disable_root: false
+EODATA
+
+    genisoimage -output "$BAKE_DIR/seed.iso" -volid cidata -joliet -rock "$BAKE_DIR/cidata/" 2>/dev/null
+
+    # Boot for baking
+    qemu-system-x86_64 \
+        -machine q35,accel=kvm \
+        -cpu host \
+        -smp "$CPUS" \
+        -m "$RAM" \
+        -drive file="$BAKE_DIR/disk.qcow2",if=virtio \
+        -drive file="$BAKE_DIR/seed.iso",if=virtio,format=raw,readonly=on \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        -nographic \
+        -serial null \
+        -monitor none 2>/dev/null &
+    QEMU_PID=$!
+
+    echo -n "Booting..."
+    wait_for_ssh
+    echo -n " configuring..."
+    wait_for_cloud_init
+    echo " installing..."
+
+    # Run provisioning script
+    ssh "${SSH_ARGS[@]}" root@localhost 'bash -s' <<'EOPROVISION'
+set -eux
+
+# Fast apt timeouts
+echo 'Acquire::http::Timeout "2";' > /etc/apt/apt.conf.d/99timeout
+echo 'Acquire::https::Timeout "2";' >> /etc/apt/apt.conf.d/99timeout
+echo 'Acquire::Retries "2";' >> /etc/apt/apt.conf.d/99timeout
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    curl \
+    git \
+    ripgrep \
+    nodejs \
+    npm
+
+# Install codex via npm
+npm install -g @openai/codex
+
+# Install claude-code via official script
+curl -fsSL https://claude.ai/install.sh | bash
+
+# Move claude binary to /usr/local/bin so ~/.local mount doesn't matter
+mv /root/.local/bin/claude /usr/local/bin/
+
+# Hostname
+hostnamectl set-hostname vibetron
+
+# Bashrc config
+cat >> /root/.bashrc <<'BASHRC'
+export IS_SANDBOX=1
+alias claude-yolo='claude --dangerously-skip-permissions'
+alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
+cd /workspace 2>/dev/null || true
+BASHRC
+
+# Disable cloud-init for future boots
+touch /etc/cloud/cloud-init.disabled
+
+# Disable slow services
+systemctl disable apt-daily.timer apt-daily-upgrade.timer man-db.timer e2scrub_all.timer fstrim.timer unattended-upgrades 2>/dev/null || true
+systemctl mask systemd-timesyncd 2>/dev/null || true
+
+# Done
+sync
+systemctl poweroff
+EOPROVISION
+
+    # Wait for VM to shut down
+    wait $QEMU_PID 2>/dev/null || true
+
+    # Flatten the overlay into standalone image
+    echo "Saving baked image..."
+    qemu-img convert -O qcow2 "$BAKE_DIR/disk.qcow2" "$BAKED_IMAGE"
+
+    rm -rf "$BAKE_DIR"
+    trap - EXIT
+
+    echo "Baked image created: $BAKED_IMAGE"
+    echo ""
+fi
+
+# ==========================================================================
+# NORMAL RUN
+# ==========================================================================
+INSTANCE_DIR=$(mktemp -d /tmp/vibetron.XXXXXX)
+
+cleanup() {
+    if [ -n "${QEMU_PID:-}" ]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+    fi
+    for pid in ${VIRTIOFSD_PIDS:-}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    rm -rf "$INSTANCE_DIR"
+}
+trap cleanup EXIT
+
+# Create ephemeral overlay on baked image (or base if no-bake)
+RUN_IMAGE="$BAKED_IMAGE"
+[ "$NO_BAKE" -eq 1 ] && RUN_IMAGE="$BASE_IMAGE"
+qemu-img create -f qcow2 -b "$RUN_IMAGE" -F qcow2 "$INSTANCE_DIR/disk.qcow2" "$DISK_SIZE" > /dev/null
+
+# Start virtiofsd for workspace, claude config, and codex config
+VHOST_SOCK_WORKSPACE="$INSTANCE_DIR/vhost-workspace.sock"
+VHOST_SOCK_CLAUDE="$INSTANCE_DIR/vhost-claude.sock"
+VHOST_SOCK_CODEX="$INSTANCE_DIR/vhost-codex.sock"
+
+$VIRTIOFSD --socket-path="$VHOST_SOCK_WORKSPACE" --shared-dir="$CURRENT_DIR" --sandbox=namespace 2>/dev/null &
+VIRTIOFSD_PIDS="$!"
+
+$VIRTIOFSD --socket-path="$VHOST_SOCK_CLAUDE" --shared-dir="$HOME/.claude" --sandbox=namespace 2>/dev/null &
+VIRTIOFSD_PIDS="$VIRTIOFSD_PIDS $!"
+
+$VIRTIOFSD --socket-path="$VHOST_SOCK_CODEX" --shared-dir="$HOME/.codex" --sandbox=namespace 2>/dev/null &
+VIRTIOFSD_PIDS="$VIRTIOFSD_PIDS $!"
+
+for sock in "$VHOST_SOCK_WORKSPACE" "$VHOST_SOCK_CLAUDE" "$VHOST_SOCK_CODEX"; do
+    for _ in $(seq 1 10); do
+        [ -S "$sock" ] && break
+        sleep 0.5
+    done
+    [ -S "$sock" ] || { echo "virtiofsd failed to start: $sock"; exit 1; }
+done
+
+# Boot VM
+qemu-system-x86_64 \
+    -machine q35,accel=kvm,memory-backend=mem0 \
+    -cpu host \
+    -smp "$CPUS" \
+    -m "$RAM" \
+    -object memory-backend-memfd,id=mem0,size="$RAM",share=on \
+    -drive file="$INSTANCE_DIR/disk.qcow2",if=virtio \
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
+    -device virtio-net-pci,netdev=net0 \
+    -chardev socket,id=vhost0,path="$VHOST_SOCK_WORKSPACE" \
+    -device vhost-user-fs-pci,queue-size=1024,chardev=vhost0,tag=workspace \
+    -chardev socket,id=vhost1,path="$VHOST_SOCK_CLAUDE" \
+    -device vhost-user-fs-pci,queue-size=1024,chardev=vhost1,tag=claude \
+    -chardev socket,id=vhost2,path="$VHOST_SOCK_CODEX" \
+    -device vhost-user-fs-pci,queue-size=1024,chardev=vhost2,tag=codex \
+    -nographic \
+    -serial null \
+    -monitor none 2>/dev/null &
+QEMU_PID=$!
+
+echo -n "Booting on SSH port $SSH_PORT..."
+wait_for_ssh
+echo " ready"
+
+# Mount filesystems
+ssh "${SSH_ARGS[@]}" root@localhost 'bash -s' <<'EOMOUNT'
+mkdir -p /workspace /root/.claude /root/.codex
+mount -t virtiofs workspace /workspace
+mount -t virtiofs claude /root/.claude
+mount -t virtiofs codex /root/.codex
+[ -d /workspace/.git ] && mount --bind /tmp /workspace/.git || true
+ln -sfn /root/.claude/.claude.json /root/.claude.json
+EOMOUNT
+
+# Interactive shell
+ssh "${SSH_ARGS[@]}" -t root@localhost 'cd /workspace && exec bash -i'
+
+# Mirror mounted Claude config back to legacy host location for compatibility.
+if [ -f "$CLAUDE_MOUNT_FILE" ] && ! cmp -s "$CLAUDE_MOUNT_FILE" "$CLAUDE_LEGACY_HOST_FILE" 2>/dev/null; then
+    cp "$CLAUDE_MOUNT_FILE" "$CLAUDE_LEGACY_HOST_FILE"
+fi
+
+# Shutdown
+ssh "${SSH_ARGS[@]}" root@localhost "poweroff" 2>/dev/null || true
+wait $QEMU_PID 2>/dev/null || true
