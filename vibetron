@@ -18,6 +18,7 @@ BAKED_IMAGE="$CACHE_DIR/baked.qcow2"
 BASE_IMAGE=""
 UPDATE_BAKED=0
 NO_BAKE=0
+HIDE_GIT=1
 
 usage() {
     cat <<'USAGE'
@@ -37,6 +38,7 @@ Options:
   --baked-image PATH       Path to baked image (default: cache-dir/baked.qcow2)
   --update-baked           Rebuild the baked image
   --no-bake                Run without baking
+  --no-hide-git            Expose .git inside the VM (hidden by default)
   --help                   Show this help and exit
 
 Notes:
@@ -124,6 +126,10 @@ while [ $# -gt 0 ]; do
             UPDATE_BAKED=1; shift ;;
         --no-bake)
             NO_BAKE=1; shift ;;
+        --hide-git)
+            HIDE_GIT=1; shift ;;
+        --no-hide-git)
+            HIDE_GIT=0; shift ;;
         --help|-h)
             usage; exit 0 ;;
         *)
@@ -389,12 +395,12 @@ wait_for_ssh
 echo " ready"
 
 # Mount filesystems
-ssh "${SSH_ARGS[@]}" root@localhost 'bash -s' <<'EOMOUNT'
+ssh "${SSH_ARGS[@]}" root@localhost "HIDE_GIT=$HIDE_GIT bash -s" <<'EOMOUNT'
 mkdir -p /workspace /root/.claude /root/.codex
 mount -t virtiofs workspace /workspace
 mount -t virtiofs claude /root/.claude
 mount -t virtiofs codex /root/.codex
-[ -d /workspace/.git ] && mount --bind /tmp /workspace/.git || true
+[ "$HIDE_GIT" = "1" ] && [ -d /workspace/.git ] && mount --bind /tmp /workspace/.git || true
 ln -sfn /root/.claude/.claude.json /root/.claude.json
 EOMOUNT
 
