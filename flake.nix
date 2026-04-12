@@ -47,5 +47,8 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = [ vibetron ];
       };
+      nixosModules.default = { pkgs, ... }: {
+        environment.systemPackages = [ self.packages.${pkgs.system}.default ];
+      };
     };
 }
