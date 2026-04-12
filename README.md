@@ -23,6 +23,33 @@ On Arch Linux:
 sudo pacman -S qemu-full virtiofsd cdrtools curl openssh iproute2
 ```
 
+On NixOS (or any system with Nix + flakes), a `flake.nix` is provided that
+wraps the script with all of its runtime dependencies. You also need KVM
+enabled on the host (`virtualisation.libvirtd.enable = true;` or at minimum
+`boot.kernelModules = [ "kvm-intel" ];`/`"kvm-amd"`, plus your user in the
+`kvm` group).
+
+Run it directly without installing:
+
+```bash
+nix run github:angelakis/vibetron
+# or from a local checkout:
+nix run .
+```
+
+Install into your profile:
+
+```bash
+nix profile install github:angelakis/vibetron
+vibetron
+```
+
+Or drop into a dev shell that has `vibetron` on `PATH`:
+
+```bash
+nix develop
+```
+
 ## Usage
 
 ```bash

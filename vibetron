@@ -190,7 +190,10 @@ fi
 VIRTIOFSD=""
 for path in /usr/libexec/virtiofsd /usr/lib/virtiofsd /usr/lib/qemu/virtiofsd; do
     [ -x "$path" ] && VIRTIOFSD="$path" && break
- done
+done
+if [ -z "$VIRTIOFSD" ]; then
+    VIRTIOFSD="$(command -v virtiofsd 2>/dev/null || true)"
+fi
 [ -z "$VIRTIOFSD" ] && die "virtiofsd not found. Install: sudo apt install virtiofsd"
 
 # ==========================================================================
