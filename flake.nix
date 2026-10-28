@@ -43,12 +43,13 @@
       apps.${system}.default = {
         type = "app";
         program = "${vibetron}/bin/vibetron";
+        meta.description = vibetron.meta.description;
       };
       devShells.${system}.default = pkgs.mkShell {
         packages = [ vibetron ];
       };
       nixosModules.default = { pkgs, ... }: {
-        environment.systemPackages = [ self.packages.${pkgs.system}.default ];
+        environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
       };
     };
 }
