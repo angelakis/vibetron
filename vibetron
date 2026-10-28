@@ -19,6 +19,8 @@ BASE_IMAGE=""
 UPDATE_BAKED=0
 NO_BAKE=0
 HIDE_GIT=1
+EXTRA_SSH_ARGS=()
+GUEST_ENV=()
 
 usage() {
     cat <<'USAGE'
@@ -39,6 +41,11 @@ Options:
   --update-baked           Rebuild the baked image
   --no-bake                Run without baking
   --no-hide-git            Expose .git inside the VM (hidden by default)
+  --ssh-flags "FLAGS"      Extra flags for the interactive SSH session, e.g.
+                           "-R 11434:localhost:11434" to reach a host service
+                           from the VM at localhost:11434
+  --env KEY=VALUE          Set an environment variable in the VM shell
+                           (repeatable)
   --help                   Show this help and exit
 
 Notes:
@@ -130,6 +137,14 @@ while [ $# -gt 0 ]; do
             HIDE_GIT=1; shift ;;
         --no-hide-git)
             HIDE_GIT=0; shift ;;
+        --ssh-flags)
+            require_value "$@"
+            read -r -a _flags <<< "$2"
+            EXTRA_SSH_ARGS+=("${_flags[@]}"); shift 2 ;;
+        --env)
+            require_value "$@"
+            [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "invalid --env value (expected KEY=VALUE): $2"
+            GUEST_ENV+=("$2"); shift 2 ;;
         --help|-h)
             usage; exit 0 ;;
         *)
@@ -407,8 +422,15 @@ mount -t virtiofs codex /root/.codex
 ln -sfn /root/.claude/.claude.json /root/.claude.json
 EOMOUNT
 
+# Export user-provided environment variables in the VM shell
+if [ "${#GUEST_ENV[@]}" -gt 0 ]; then
+    for kv in "${GUEST_ENV[@]}"; do
+        printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
+    done | ssh "${SSH_ARGS[@]}" root@localhost "cat >> /root/.bashrc"
+fi
+
 # Interactive shell
-ssh "${SSH_ARGS[@]}" -t root@localhost 'cd /workspace && exec bash -i'
+ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost 'cd /workspace && exec bash -i'
 
 # Mirror mounted Claude config back to legacy host location for compatibility.
 if [ -f "$CLAUDE_MOUNT_FILE" ] && ! cmp -s "$CLAUDE_MOUNT_FILE" "$CLAUDE_LEGACY_HOST_FILE" 2>/dev/null; then

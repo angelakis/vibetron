@@ -73,6 +73,24 @@ Host directories `~/.claude` and `~/.codex` are mounted in, so your API keys and
 
 If your project has a `.git` directory, Vibetron bind-mounts `/tmp` over `/workspace/.git` inside the VM. This keeps agents from reading or writing your host Git metadata while still allowing normal file edits in `/workspace`.
 
+## Using a model on the host or local network
+
+Use `--ssh-flags` to forward a port over SSH, then point Claude Code at it with `--env`. The host makes the onward connection, so the target can be a server on the host or anywhere the host can reach:
+
+```bash
+# Ollama on the host, reachable in the VM at localhost:11434
+./vibetron --ssh-flags "-R 11434:localhost:11434" \
+  --env ANTHROPIC_BASE_URL=http://localhost:11434 \
+  --env ANTHROPIC_AUTH_TOKEN=ollama \
+  --env ANTHROPIC_MODEL=qwen3-coder
+
+# A server on the LAN, reachable in the VM at localhost:8000
+./vibetron --ssh-flags "-R 8000:192.168.1.50:8000" \
+  --env ANTHROPIC_BASE_URL=http://localhost:8000
+```
+
+The endpoint must speak the Anthropic Messages API (recent Ollama and llama.cpp servers do; otherwise put a LiteLLM proxy in front). Forwards last for as long as the VM shell is open.
+
 ## Options
 
 | Flag | Default | Description |
@@ -87,3 +105,6 @@ If your project has a `.git` directory, Vibetron bind-mounts `/tmp` over `/works
 | `--baked-image PATH` | `cache-dir/baked.qcow2` | Override baked image path |
 | `--update-baked` | — | Force rebuild the baked image |
 | `--no-bake` | — | Skip baking, use base image directly |
+| `--no-hide-git` | — | Expose `.git` inside the VM |
+| `--ssh-flags "FLAGS"` | — | Extra flags for the interactive SSH session (e.g. `-R` port forwards) |
+| `--env KEY=VALUE` | — | Set an environment variable in the VM shell (repeatable) |
