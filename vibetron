@@ -21,13 +21,14 @@ NO_BAKE=0
 HIDE_GIT=1
 EXTRA_SSH_ARGS=()
 GUEST_ENV=()
+AGENT=""
 
 usage() {
     cat <<'USAGE'
 Usage: vibetron [options]
 
 Creates a VM using a prebaked Debian image, mounts the current folder, and
-provisions Claude Code and Codex for safe agent use.
+provisions Claude Code, Codex and Pi for safe agent use.
 
 Options:
   --ram SIZE               VM memory (default: 4G)
@@ -46,6 +47,8 @@ Options:
                            from the VM at localhost:11434
   --env KEY=VALUE          Set an environment variable in the VM shell
                            (repeatable)
+  --agent NAME             Start an agent instead of a shell: claude,
+                           claude-yolo, codex, codex-yolo or pi
   --help                   Show this help and exit
 
 Notes:
@@ -145,6 +148,13 @@ while [ $# -gt 0 ]; do
             require_value "$@"
             [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "invalid --env value (expected KEY=VALUE): $2"
             GUEST_ENV+=("$2"); shift 2 ;;
+        --agent)
+            require_value "$@"
+            case "$2" in
+                claude|claude-yolo|codex|codex-yolo|pi) AGENT="$2" ;;
+                *) die "invalid --agent value (expected claude, claude-yolo, codex, codex-yolo or pi): $2" ;;
+            esac
+            shift 2 ;;
         --help|-h)
             usage; exit 0 ;;
         *)
@@ -179,8 +189,8 @@ SSH_PUBKEY=$(cat "$SSH_KEY.pub")
 
 SSH_ARGS=(-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" -p "$SSH_PORT")
 
-# Ensure claude and codex config dirs exist on host
-mkdir -p "$HOME/.claude" "$HOME/.codex"
+# Ensure claude, codex and pi config dirs exist on host
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.pi"
 CLAUDE_LEGACY_HOST_FILE="$HOME/.claude.json"
 CLAUDE_MOUNT_FILE="$HOME/.claude/.claude.json"
 
@@ -292,13 +302,17 @@ apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     curl \
+    ca-certificates \
     git \
-    ripgrep \
-    nodejs \
-    npm
+    ripgrep
 
-# Install codex via npm
+# Debian's nodejs is too old for pi (needs >= 22.19), use NodeSource LTS
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt-get install -y --no-install-recommends nodejs
+
+# Install codex and pi via npm
 npm install -g @openai/codex
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
 # Install claude-code via official script
 curl -fsSL https://claude.ai/install.sh | bash
@@ -365,10 +379,11 @@ RUN_IMAGE="$BAKED_IMAGE"
 [ "$NO_BAKE" -eq 1 ] && RUN_IMAGE="$BASE_IMAGE"
 qemu-img create -f qcow2 -b "$RUN_IMAGE" -F qcow2 "$INSTANCE_DIR/disk.qcow2" "$DISK_SIZE" > /dev/null
 
-# Start virtiofsd for workspace, claude config, and codex config
+# Start virtiofsd for workspace, claude, codex and pi config
 VHOST_SOCK_WORKSPACE="$INSTANCE_DIR/vhost-workspace.sock"
 VHOST_SOCK_CLAUDE="$INSTANCE_DIR/vhost-claude.sock"
 VHOST_SOCK_CODEX="$INSTANCE_DIR/vhost-codex.sock"
+VHOST_SOCK_PI="$INSTANCE_DIR/vhost-pi.sock"
 
 $VIRTIOFSD --socket-path="$VHOST_SOCK_WORKSPACE" --shared-dir="$CURRENT_DIR" --sandbox=namespace 2>/dev/null &
 VIRTIOFSD_PIDS="$!"
@@ -379,7 +394,10 @@ VIRTIOFSD_PIDS="$VIRTIOFSD_PIDS $!"
 $VIRTIOFSD --socket-path="$VHOST_SOCK_CODEX" --shared-dir="$HOME/.codex" --sandbox=namespace 2>/dev/null &
 VIRTIOFSD_PIDS="$VIRTIOFSD_PIDS $!"
 
-for sock in "$VHOST_SOCK_WORKSPACE" "$VHOST_SOCK_CLAUDE" "$VHOST_SOCK_CODEX"; do
+$VIRTIOFSD --socket-path="$VHOST_SOCK_PI" --shared-dir="$HOME/.pi" --sandbox=namespace 2>/dev/null &
+VIRTIOFSD_PIDS="$VIRTIOFSD_PIDS $!"
+
+for sock in "$VHOST_SOCK_WORKSPACE" "$VHOST_SOCK_CLAUDE" "$VHOST_SOCK_CODEX" "$VHOST_SOCK_PI"; do
     for _ in $(seq 1 10); do
         [ -S "$sock" ] && break
         sleep 0.5
@@ -403,6 +421,8 @@ qemu-system-x86_64 \
     -device vhost-user-fs-pci,queue-size=1024,chardev=vhost1,tag=claude \
     -chardev socket,id=vhost2,path="$VHOST_SOCK_CODEX" \
     -device vhost-user-fs-pci,queue-size=1024,chardev=vhost2,tag=codex \
+    -chardev socket,id=vhost3,path="$VHOST_SOCK_PI" \
+    -device vhost-user-fs-pci,queue-size=1024,chardev=vhost3,tag=pi \
     -nographic \
     -serial null \
     -monitor none 2>/dev/null &
@@ -414,10 +434,11 @@ echo " ready"
 
 # Mount filesystems
 ssh "${SSH_ARGS[@]}" root@localhost "HIDE_GIT=$HIDE_GIT bash -s" <<'EOMOUNT'
-mkdir -p /workspace /root/.claude /root/.codex
+mkdir -p /workspace /root/.claude /root/.codex /root/.pi
 mount -t virtiofs workspace /workspace
 mount -t virtiofs claude /root/.claude
 mount -t virtiofs codex /root/.codex
+mount -t virtiofs pi /root/.pi
 [ "$HIDE_GIT" = "1" ] && [ -d /workspace/.git ] && mount --bind /tmp /workspace/.git || true
 ln -sfn /root/.claude/.claude.json /root/.claude.json
 EOMOUNT
@@ -429,8 +450,25 @@ if [ "${#GUEST_ENV[@]}" -gt 0 ]; then
     done | ssh "${SSH_ARGS[@]}" root@localhost "cat >> /root/.bashrc"
 fi
 
-# Interactive shell
-ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost 'cd /workspace && exec bash -i'
+# Interactive shell, or the requested agent
+case "$AGENT" in
+    claude)      GUEST_CMD='claude' ;;
+    claude-yolo) GUEST_CMD='claude --dangerously-skip-permissions' ;;
+    codex)       GUEST_CMD='codex' ;;
+    codex-yolo)  GUEST_CMD='codex --dangerously-bypass-approvals-and-sandbox' ;;
+    pi)          GUEST_CMD='pi' ;;
+    *)           GUEST_CMD='' ;;
+esac
+if [ -n "$GUEST_CMD" ]; then
+    # bash -i so .bashrc (IS_SANDBOX, --env exports) is loaded first
+    if ! ssh "${SSH_ARGS[@]}" root@localhost "command -v ${GUEST_CMD%% *}" >/dev/null; then
+        echo "Error: ${GUEST_CMD%% *} is not installed in the image; rebuild it with --update-baked" >&2
+        exit 1
+    fi
+    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost "cd /workspace && exec bash -ic '$GUEST_CMD'"
+else
+    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost 'cd /workspace && exec bash -i'
+fi
 
 # Mirror mounted Claude config back to legacy host location for compatibility.
 if [ -f "$CLAUDE_MOUNT_FILE" ] && ! cmp -s "$CLAUDE_MOUNT_FILE" "$CLAUDE_LEGACY_HOST_FILE" 2>/dev/null; then

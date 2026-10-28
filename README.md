@@ -1,6 +1,6 @@
 # Vibetron
 
-A single bash script that spins up an ephemeral QEMU/KVM virtual machine pre-loaded with [Claude Code](https://claude.ai) and [Codex](https://github.com/openai/codex) — a sandboxed environment for running AI coding agents safely.
+A single bash script that spins up an ephemeral QEMU/KVM virtual machine pre-loaded with [Claude Code](https://claude.ai), [Codex](https://github.com/openai/codex) and [Pi](https://pi.dev) — a sandboxed environment for running AI coding agents safely.
 
 Your current directory is mounted read-write into the VM at `/workspace`, so agents can edit your code without risking your host system.
 
@@ -56,9 +56,10 @@ nix develop
 ./vibetron              # 4G RAM, 4 CPUs, 10G disk
 ./vibetron --ram 8G --cpus 8
 ./vibetron --update-baked   # rebuild the provisioned image
+./vibetron --agent claude   # start Claude Code directly; also claude-yolo, codex, codex-yolo or pi
 ```
 
-On first run, Vibetron downloads a Debian 13 cloud image, bakes in dev tools (build-essential, node, ripgrep, Claude Code, Codex), and caches the result for fast subsequent boots.
+On first run, Vibetron downloads a Debian 13 cloud image, bakes in dev tools (build-essential, Node.js 24, ripgrep, Claude Code, Codex, Pi), and caches the result for fast subsequent boots.
 
 ## Inside the VM
 
@@ -69,7 +70,9 @@ claude-yolo   # claude --dangerously-skip-permissions
 codex-yolo    # codex --dangerously-bypass-approvals-and-sandbox
 ```
 
-Host directories `~/.claude` and `~/.codex` are mounted in, so your API keys and config carry over automatically.
+`pi` is also installed; it has no approval prompts, so it needs no yolo alias.
+
+Host directories `~/.claude`, `~/.codex` and `~/.pi` are mounted in, so your API keys and config carry over automatically.
 
 If your project has a `.git` directory, Vibetron bind-mounts `/tmp` over `/workspace/.git` inside the VM. This keeps agents from reading or writing your host Git metadata while still allowing normal file edits in `/workspace`.
 
@@ -108,3 +111,4 @@ The endpoint must speak the Anthropic Messages API (recent Ollama and llama.cpp 
 | `--no-hide-git` | — | Expose `.git` inside the VM |
 | `--ssh-flags "FLAGS"` | — | Extra flags for the interactive SSH session (e.g. `-R` port forwards) |
 | `--env KEY=VALUE` | — | Set an environment variable in the VM shell (repeatable) |
+| `--agent NAME` | — | Start `claude`, `claude-yolo`, `codex`, `codex-yolo` or `pi` instead of a shell; the VM shuts down when it exits |
