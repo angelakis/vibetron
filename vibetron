@@ -493,6 +493,11 @@ mount -t virtiofs codex /root/.codex
 mount -t virtiofs pi /root/.pi
 [ "$HIDE_GIT" = "1" ] && [ -d /workspace/.git ] && mount --bind /tmp /workspace/.git || true
 ln -sfn /root/.claude/.claude.json /root/.claude.json
+# ~/.codex is shared with the host, so codex's background server install recorded
+# there doesn't resolve in the VM; run without it. Also covers codex-yolo and --agent.
+if codex --help 2>/dev/null | grep -q -- '--no-daemon'; then
+    echo "alias codex='codex --no-daemon'" >> /root/.bashrc
+fi
 EOMOUNT
 
 # Export user-provided environment variables in the VM shell
