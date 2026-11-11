@@ -14,7 +14,7 @@ IMAGE_NAME="debian-13-genericcloud-amd64-daily.qcow2"
 IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/daily/latest/$IMAGE_NAME"
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vibetron"
-BAKED_IMAGE="$CACHE_DIR/baked.qcow2"
+BAKED_IMAGE=""
 BASE_IMAGE=""
 UPDATE_BAKED=0
 NO_BAKE=0
@@ -73,24 +73,58 @@ require_value() {
     [ $# -ge 2 ] || die "missing value for $1"
 }
 
-wait_for_ssh() {
-    local start="$SECONDS"
-    while ! ssh "${SSH_ARGS[@]}" -o ConnectTimeout=1 root@localhost true 2>/dev/null; do
+# Fail with whatever QEMU and the guest console said, instead of a bare message.
+vm_die() {
+    echo >&2
+    if [ -s "${QEMU_LOG:-}" ]; then
+        echo "--- qemu output ---" >&2
+        tail -n 20 "$QEMU_LOG" >&2
+    fi
+    if [ -n "${WAIT_LAST_ERR:-}" ]; then
+        echo "--- last ssh error ---" >&2
+        printf '%s\n' "$WAIT_LAST_ERR" | tail -n 10 >&2
+    fi
+    if [ -s "${SERIAL_LOG:-}" ]; then
+        echo "--- last guest console output ---" >&2
+        tail -n 25 "$SERIAL_LOG" >&2
+    fi
+    die "$*"
+}
+
+# Warn if the filesystem holding DIR has less than GB gigabytes free. QEMU
+# pauses the guest when its disk image can't grow, which looks like a hang.
+warn_low_space() {
+    local dir="$1" need_gb="$2" avail_kb
+    avail_kb="$(df -Pk "$dir" 2>/dev/null | tail -n 1 | tr -s ' ' | cut -d ' ' -f 4)"
+    case "$avail_kb" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$avail_kb" -lt $((need_gb * 1024 * 1024)) ]; then
+        echo "Warning: only $((avail_kb / 1024)) MB free in $dir (want ~${need_gb} GB);" \
+            "the VM will freeze if it runs out." >&2
+    fi
+}
+
+# Wait until "$@" succeeds; fail early if QEMU exits, or after WAIT_TIMEOUT.
+wait_for_vm() {
+    local what="$1" start="$SECONDS"
+    shift
+    while ! WAIT_LAST_ERR="$("$@" 2>&1 >/dev/null)"; do
+        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            vm_die "QEMU exited while waiting for $what"
+        fi
         if [ $((SECONDS - start)) -ge "$WAIT_TIMEOUT" ]; then
-            die "timed out waiting for SSH after ${WAIT_TIMEOUT}s"
+            vm_die "timed out waiting for $what after ${WAIT_TIMEOUT}s" \
+                "(raise with VIBETRON_WAIT_TIMEOUT=seconds if the VM is just slow)"
         fi
         sleep 1
     done
 }
 
+wait_for_ssh() {
+    wait_for_vm SSH ssh "${SSH_ARGS[@]}" -o ConnectTimeout=1 root@localhost true
+}
+
 wait_for_cloud_init() {
-    local start="$SECONDS"
-    while ! ssh "${SSH_ARGS[@]}" root@localhost "cloud-init status --wait" >/dev/null 2>&1; do
-        if [ $((SECONDS - start)) -ge "$WAIT_TIMEOUT" ]; then
-            die "timed out waiting for cloud-init after ${WAIT_TIMEOUT}s"
-        fi
-        sleep 1
-    done
+    wait_for_vm cloud-init ssh "${SSH_ARGS[@]}" root@localhost "cloud-init status --wait"
 }
 
 pick_free_port() {
@@ -179,6 +213,8 @@ need_cmd curl
 need_cmd genisoimage
 
 mkdir -p "$CACHE_DIR"
+# Resolved here so --cache-dir also applies to the baked image
+[ -n "$BAKED_IMAGE" ] || BAKED_IMAGE="$CACHE_DIR/baked.qcow2"
 
 # Get or create SSH key
 SSH_KEY="$CACHE_DIR/vibetron_key"
@@ -240,8 +276,14 @@ if [ "$NO_BAKE" -eq 0 ] && { [ ! -f "$BAKED_IMAGE" ] || [ "$UPDATE_BAKED" -eq 1 
     echo "Creating baked image..."
     echo "========================================"
 
-    BAKE_DIR=$(mktemp -d /tmp/vibetron-bake.XXXXXX)
-    BAKE_CLEANUP() { rm -rf "$BAKE_DIR"; }
+    # The bake disk grows to several GB, so it lives in the cache dir, not /tmp
+    # (often a small RAM-backed tmpfs).
+    BAKE_DIR=$(mktemp -d "$CACHE_DIR/bake.XXXXXX")
+    warn_low_space "$CACHE_DIR" 6
+    BAKE_CLEANUP() {
+        [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null || true
+        rm -rf "$BAKE_DIR"
+    }
     trap BAKE_CLEANUP EXIT
 
     # Create disk for baking (standalone, not overlay)
@@ -267,6 +309,8 @@ EODATA
     genisoimage -output "$BAKE_DIR/seed.iso" -volid cidata -joliet -rock "$BAKE_DIR/cidata/" 2>/dev/null
 
     # Boot for baking
+    QEMU_LOG="$BAKE_DIR/qemu.log"
+    SERIAL_LOG="$BAKE_DIR/serial.log"
     qemu-system-x86_64 \
         -machine q35,accel=kvm \
         -cpu host \
@@ -277,8 +321,8 @@ EODATA
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
         -device virtio-net-pci,netdev=net0 \
         -nographic \
-        -serial null \
-        -monitor none 2>/dev/null &
+        -serial "file:$SERIAL_LOG" \
+        -monitor none 2>"$QEMU_LOG" &
     QEMU_PID=$!
 
     echo -n "Booting..."
@@ -361,6 +405,7 @@ fi
 # NORMAL RUN
 # ==========================================================================
 INSTANCE_DIR=$(mktemp -d /tmp/vibetron.XXXXXX)
+warn_low_space "$INSTANCE_DIR" 1
 
 cleanup() {
     if [ -n "${QEMU_PID:-}" ]; then
@@ -406,6 +451,8 @@ for sock in "$VHOST_SOCK_WORKSPACE" "$VHOST_SOCK_CLAUDE" "$VHOST_SOCK_CODEX" "$V
 done
 
 # Boot VM
+QEMU_LOG="$INSTANCE_DIR/qemu.log"
+SERIAL_LOG="$INSTANCE_DIR/serial.log"
 qemu-system-x86_64 \
     -machine q35,accel=kvm,memory-backend=mem0 \
     -cpu host \
@@ -424,8 +471,8 @@ qemu-system-x86_64 \
     -chardev socket,id=vhost3,path="$VHOST_SOCK_PI" \
     -device vhost-user-fs-pci,queue-size=1024,chardev=vhost3,tag=pi \
     -nographic \
-    -serial null \
-    -monitor none 2>/dev/null &
+    -serial "file:$SERIAL_LOG" \
+    -monitor none 2>"$QEMU_LOG" &
 QEMU_PID=$!
 
 echo -n "Booting on SSH port $SSH_PORT..."
