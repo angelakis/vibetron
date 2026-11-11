@@ -80,13 +80,15 @@ vm_die() {
         echo "--- qemu output ---" >&2
         tail -n 20 "$QEMU_LOG" >&2
     fi
+    if [ -s "${SERIAL_LOG:-}" ]; then
+        echo "--- last guest console output ---" >&2
+        # Strip escape sequences so the terminal doesn't answer the guest's queries
+        tail -n 25 "$SERIAL_LOG" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\000-\010\013-\037' >&2
+    fi
+    # Printed last so it isn't scrolled away by the console output
     if [ -n "${WAIT_LAST_ERR:-}" ]; then
         echo "--- last ssh error ---" >&2
         printf '%s\n' "$WAIT_LAST_ERR" | tail -n 10 >&2
-    fi
-    if [ -s "${SERIAL_LOG:-}" ]; then
-        echo "--- last guest console output ---" >&2
-        tail -n 25 "$SERIAL_LOG" >&2
     fi
     die "$*"
 }
@@ -120,11 +122,11 @@ wait_for_vm() {
 }
 
 wait_for_ssh() {
-    wait_for_vm SSH ssh "${SSH_ARGS[@]}" -o ConnectTimeout=1 root@localhost true
+    wait_for_vm SSH ssh "${SSH_ARGS[@]}" -o ConnectTimeout=1 root@127.0.0.1 true
 }
 
 wait_for_cloud_init() {
-    wait_for_vm cloud-init ssh "${SSH_ARGS[@]}" root@localhost "cloud-init status --wait"
+    wait_for_vm cloud-init ssh "${SSH_ARGS[@]}" root@127.0.0.1 "cloud-init status --wait"
 }
 
 pick_free_port() {
@@ -223,7 +225,10 @@ if [ ! -f "$SSH_KEY" ]; then
 fi
 SSH_PUBKEY=$(cat "$SSH_KEY.pub")
 
-SSH_ARGS=(-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" -p "$SSH_PORT")
+# -F /dev/null: ignore host ssh configs, which can break or redirect the connection.
+# IdentitiesOnly: don't burn the guest's auth attempts on unrelated ssh-agent keys.
+SSH_ARGS=(-F /dev/null -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
+          -o IdentitiesOnly=yes -i "$SSH_KEY" -p "$SSH_PORT")
 
 # Ensure claude, codex and pi config dirs exist on host
 mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.pi"
@@ -332,7 +337,7 @@ EODATA
     echo " installing..."
 
     # Run provisioning script
-    ssh "${SSH_ARGS[@]}" root@localhost 'bash -s' <<'EOPROVISION'
+    ssh "${SSH_ARGS[@]}" root@127.0.0.1 'bash -s' <<'EOPROVISION'
 set -eux
 
 # Fast apt timeouts
@@ -480,7 +485,7 @@ wait_for_ssh
 echo " ready"
 
 # Mount filesystems
-ssh "${SSH_ARGS[@]}" root@localhost "HIDE_GIT=$HIDE_GIT bash -s" <<'EOMOUNT'
+ssh "${SSH_ARGS[@]}" root@127.0.0.1 "HIDE_GIT=$HIDE_GIT bash -s" <<'EOMOUNT'
 mkdir -p /workspace /root/.claude /root/.codex /root/.pi
 mount -t virtiofs workspace /workspace
 mount -t virtiofs claude /root/.claude
@@ -494,7 +499,7 @@ EOMOUNT
 if [ "${#GUEST_ENV[@]}" -gt 0 ]; then
     for kv in "${GUEST_ENV[@]}"; do
         printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
-    done | ssh "${SSH_ARGS[@]}" root@localhost "cat >> /root/.bashrc"
+    done | ssh "${SSH_ARGS[@]}" root@127.0.0.1 "cat >> /root/.bashrc"
 fi
 
 # Interactive shell, or the requested agent
@@ -508,13 +513,13 @@ case "$AGENT" in
 esac
 if [ -n "$GUEST_CMD" ]; then
     # bash -i so .bashrc (IS_SANDBOX, --env exports) is loaded first
-    if ! ssh "${SSH_ARGS[@]}" root@localhost "command -v ${GUEST_CMD%% *}" >/dev/null; then
+    if ! ssh "${SSH_ARGS[@]}" root@127.0.0.1 "command -v ${GUEST_CMD%% *}" >/dev/null; then
         echo "Error: ${GUEST_CMD%% *} is not installed in the image; rebuild it with --update-baked" >&2
         exit 1
     fi
-    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost "cd /workspace && exec bash -ic '$GUEST_CMD'"
+    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@127.0.0.1 "cd /workspace && exec bash -ic '$GUEST_CMD'"
 else
-    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@localhost 'cd /workspace && exec bash -i'
+    ssh "${SSH_ARGS[@]}" ${EXTRA_SSH_ARGS[@]+"${EXTRA_SSH_ARGS[@]}"} -t root@127.0.0.1 'cd /workspace && exec bash -i'
 fi
 
 # Mirror mounted Claude config back to legacy host location for compatibility.
@@ -523,5 +528,5 @@ if [ -f "$CLAUDE_MOUNT_FILE" ] && ! cmp -s "$CLAUDE_MOUNT_FILE" "$CLAUDE_LEGACY_
 fi
 
 # Shutdown
-ssh "${SSH_ARGS[@]}" root@localhost "poweroff" 2>/dev/null || true
+ssh "${SSH_ARGS[@]}" root@127.0.0.1 "poweroff" 2>/dev/null || true
 wait $QEMU_PID 2>/dev/null || true

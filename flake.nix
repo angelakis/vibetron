@@ -15,6 +15,7 @@
         coreutils   # shuf, seq, mktemp
         diffutils   # cmp
         gnugrep
+        gnused
       ];
       vibetron = pkgs.stdenv.mkDerivation {
         pname = "vibetron";
